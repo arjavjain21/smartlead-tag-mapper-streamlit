@@ -283,59 +283,63 @@ if uploaded is not None:
             df["email_account_id"] = df["email"].map(email_to_id).fillna("n/a")
             df["tag_id"] = df["tag"].map(tag_to_id).fillna("n/a")
 
+            st.session_state["mapped_df"] = df
             st.success("Mapping complete")
-            st.dataframe(df.head(50))
 
-            # Provide CSV download
-            out_csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download mapped CSV", data=out_csv, file_name="mapped_emails_tags.csv", mime="text/csv")
+    mapped_df = st.session_state.get("mapped_df")
+    if mapped_df is not None:
+        st.dataframe(mapped_df.head(50))
 
-            st.subheader("3. Apply tags to Smartlead accounts, optional")
+        # Provide CSV download
+        out_csv = mapped_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download mapped CSV", data=out_csv, file_name="mapped_emails_tags.csv", mime="text/csv")
 
-            dry_run = st.checkbox("Dry run, do not call API", value=True)
-            go_apply = st.button("Apply Tags")
+        st.subheader("3. Apply tags to Smartlead accounts, optional")
 
-            if go_apply:
-                if dry_run:
-                    st.info("Dry run enabled, not calling tag-mapping endpoint")
-                else:
-                    if not SMARTLEAD_API_KEY:
-                        st.error("SMARTLEAD_API_KEY is required to apply tags")
-                        st.stop()
+        dry_run = st.checkbox("Dry run, do not call API", value=True)
+        go_apply = st.button("Apply Tags")
 
-                # Group by tag_id, then apply in batches to valid email ids
-                action_logs = []
-                valid = df[(df["email_account_id"] != "n/a") & (df["tag_id"] != "n/a")]
-                invalid_rows = df[(df["email_account_id"] == "n/a") | (df["tag_id"] == "n/a")]
+        if go_apply:
+            if dry_run:
+                st.info("Dry run enabled, not calling tag-mapping endpoint")
+            else:
+                if not SMARTLEAD_API_KEY:
+                    st.error("SMARTLEAD_API_KEY is required to apply tags")
+                    st.stop()
 
-                if not invalid_rows.empty:
-                    st.warning(f"{len(invalid_rows)} rows have n/a for email_account_id or tag_id. These are skipped.")
+            # Group by tag_id, then apply in batches to valid email ids
+            action_logs = []
+            valid = mapped_df[(mapped_df["email_account_id"] != "n/a") & (mapped_df["tag_id"] != "n/a")]
+            invalid_rows = mapped_df[(mapped_df["email_account_id"] == "n/a") | (mapped_df["tag_id"] == "n/a")]
 
-                grouped = valid.groupby("tag_id")
-                total_ok = 0
-                total_fail = 0
+            if not invalid_rows.empty:
+                st.warning(f"{len(invalid_rows)} rows have n/a for email_account_id or tag_id. These are skipped.")
 
-                for tag_id, sub in grouped:
-                    ids = [int(x) for x in sub["email_account_id"].tolist()]
-                    # batch
-                    for i in range(0, len(ids), EMAIL_BATCH_LIMIT):
-                        batch = ids[i:i+EMAIL_BATCH_LIMIT]
-                        if dry_run:
-                            action_logs.append({"tag_id": int(tag_id), "batch_count": len(batch), "status": "SKIPPED, dry run"})
-                            continue
-                        ok, err = apply_tags_batch(batch, int(tag_id))
-                        if ok:
-                            total_ok += len(batch)
-                            action_logs.append({"tag_id": int(tag_id), "batch_count": len(batch), "status": "APPLIED"})
-                        else:
-                            total_fail += len(batch)
-                            action_logs.append({"tag_id": int(tag_id), "batch_count": len(batch), "status": f"FAILED, {err}"})
+            grouped = valid.groupby("tag_id")
+            total_ok = 0
+            total_fail = 0
 
-                log_df = pd.DataFrame(action_logs)
-                st.write("Action log:")
-                st.dataframe(log_df)
+            for tag_id, sub in grouped:
+                ids = [int(x) for x in sub["email_account_id"].tolist()]
+                # batch
+                for i in range(0, len(ids), EMAIL_BATCH_LIMIT):
+                    batch = ids[i:i+EMAIL_BATCH_LIMIT]
+                    if dry_run:
+                        action_logs.append({"tag_id": int(tag_id), "batch_count": len(batch), "status": "SKIPPED, dry run"})
+                        continue
+                    ok, err = apply_tags_batch(batch, int(tag_id))
+                    if ok:
+                        total_ok += len(batch)
+                        action_logs.append({"tag_id": int(tag_id), "batch_count": len(batch), "status": "APPLIED"})
+                    else:
+                        total_fail += len(batch)
+                        action_logs.append({"tag_id": int(tag_id), "batch_count": len(batch), "status": f"FAILED, {err}"})
 
-                st.success(f"Done. Applied: {total_ok}, Failed: {total_fail}")
+            log_df = pd.DataFrame(action_logs)
+            st.write("Action log:")
+            st.dataframe(log_df)
+
+            st.success(f"Done. Applied: {total_ok}, Failed: {total_fail}")
 
 else:
     st.info("Upload a CSV to begin")
