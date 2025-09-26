@@ -26,9 +26,13 @@ SMARTLEAD_BEARER = st.secrets.get("SMARTLEAD_BEARER", "").strip()
 SMARTLEAD_API_KEY = st.secrets.get("SMARTLEAD_API_KEY", "").strip()
 
 if not SMARTLEAD_BEARER:
-    st.warning("SMARTLEAD_BEARER missing in secrets. Go to .streamlit/secrets.toml.")
+    st.warning(
+        "SMARTLEAD_BEARER missing in secrets. Add it to .streamlit/secrets.toml and rerun the app."
+    )
 if not SMARTLEAD_API_KEY:
-    st.info("SMARTLEAD_API_KEY missing in secrets, you will not be able to call the tag-mapping endpoint.")
+    st.info(
+        "SMARTLEAD_API_KEY missing in secrets. Add it to .streamlit/secrets.toml before applying tags."
+    )
 
 st.set_page_config(page_title="Smartlead Tag Mapper", page_icon="🔖", layout="wide")
 
@@ -226,6 +230,13 @@ if uploaded is not None:
 
     run_mapping = st.button("Fetch and Map")
     if run_mapping:
+        if not SMARTLEAD_BEARER:
+            st.error(
+                "SMARTLEAD_BEARER secret is required before fetching Smartlead accounts and tags. "
+                "Add it to .streamlit/secrets.toml and try again."
+            )
+            st.stop()
+
         with st.spinner("Fetching accounts and tags from Smartlead"):
             errors = []
 
@@ -304,7 +315,10 @@ if uploaded is not None:
                 st.info("Dry run enabled, not calling tag-mapping endpoint")
             else:
                 if not SMARTLEAD_API_KEY:
-                    st.error("SMARTLEAD_API_KEY is required to apply tags")
+                    st.error(
+                        "SMARTLEAD_API_KEY secret is required to apply tags. "
+                        "Add it to .streamlit/secrets.toml and try again."
+                    )
                     st.stop()
 
             # Group by tag_id, then apply in batches to valid email ids
