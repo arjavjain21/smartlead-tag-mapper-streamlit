@@ -1,359 +1,268 @@
 
 import io
-import json
-import time
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
-try:
-    import chardet  # type: ignore
-    CHARDET_DETECT = chardet.detect
-except ImportError:  # pragma: no cover - optional dependency
-    chardet = None  # type: ignore
-    CHARDET_DETECT = None
-import numpy as np
+import chardet
 import pandas as pd
 import requests
 import streamlit as st
 
-# Constants
+# -------------------- Config --------------------
 GRAPHQL_URL = "https://fe-gql.smartlead.ai/v1/graphql"
-REST_ACCOUNTS_URL = "https://server.smartlead.ai/api/email-account/get-total-email-accounts"
 REST_TAG_MAPPING_URL = "https://server.smartlead.ai/api/v1/email-accounts/tag-mapping"
 EMAIL_BATCH_LIMIT = 25
 
-# Secrets
 SMARTLEAD_BEARER = st.secrets.get("SMARTLEAD_BEARER", "").strip()
 SMARTLEAD_API_KEY = st.secrets.get("SMARTLEAD_API_KEY", "").strip()
 
-if not SMARTLEAD_BEARER:
-    st.warning(
-        "SMARTLEAD_BEARER missing in secrets. Add it to .streamlit/secrets.toml and rerun the app."
-    )
-if not SMARTLEAD_API_KEY:
-    st.info(
-        "SMARTLEAD_API_KEY missing in secrets. Add it to .streamlit/secrets.toml before applying tags."
-    )
-
 st.set_page_config(page_title="Smartlead Tag Mapper", page_icon="🔖", layout="wide")
+st.title("Smartlead Tag Mapper v4")
 
-st.title("Smartlead Tag Mapper")
-
-with st.expander("Advanced, GraphQL schema configuration"):
-    st.write("If your GraphQL schema differs, adjust these queries and field names.")
-    default_accounts_query = st.text_area(
-        "GraphQL query for email accounts",
-        value=(
-            "query EmailAccounts {\n"
-            "  email_accounts {\n"
-            "    id\n"
-            "    from_email\n"
-            "  }\n"
-            "}\n"
-        ),
-        height=150,
-    )
-    accounts_root = st.text_input("Accounts root field", value="email_accounts")
-    accounts_id_field = st.text_input("Accounts id field", value="id")
-    accounts_email_field = st.text_input("Accounts from email field", value="from_email")
-
-    default_tags_query = st.text_area(
-        "GraphQL query for tags",
-        value=(
-            "query Tags {\n"
-            "  tags {\n"
-            "    id\n"
-            "    name\n"
-            "  }\n"
-            "}\n"
-        ),
-        height=150,
-    )
-    tags_root = st.text_input("Tags root field", value="tags")
-    tags_id_field = st.text_input("Tags id field", value="id")
-    tags_name_field = st.text_input("Tags name field", value="name")
-
-    use_rest_accounts_fallback = st.checkbox("Enable REST fallback for accounts", value=True)
-
-def _http_post(url: str, headers: Dict, json_body: Dict, timeout: int = 30) -> requests.Response:
-    return requests.post(url, headers=headers, json=json_body, timeout=timeout)
-
-def _http_get(url: str, headers: Dict, params: Dict, timeout: int = 30) -> requests.Response:
-    return requests.get(url, headers=headers, params=params, timeout=timeout)
-
-def fetch_email_accounts_graphql(query: str,
-                                 root: str,
-                                 id_field: str,
-                                 email_field: str) -> List[Dict]:
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {SMARTLEAD_BEARER}",
-    }
-    resp = _http_post(GRAPHQL_URL, headers, {"query": query})
-    if resp.status_code != 200:
-        raise RuntimeError(f"GraphQL accounts query failed, HTTP {resp.status_code}: {resp.text[:400]}")
-    payload = resp.json()
-    if "errors" in payload:
-        raise RuntimeError(f"GraphQL accounts error: {payload['errors']}")
-    data = payload.get("data", {})
-    rows = data.get(root, [])
-    out = []
-    for r in rows:
-        out.append({
-            "id": r.get(id_field),
-            "from_email": r.get(email_field)
-        })
-    return out
-
-def fetch_email_accounts_rest() -> List[Dict]:
-    headers = {
-        "Authorization": f"Bearer {SMARTLEAD_BEARER}",
-        "Accept": "application/json",
-    }
-    params = {"limit": 10000}
-    resp = _http_get(REST_ACCOUNTS_URL, headers, params)
-    if resp.status_code != 200:
-        raise RuntimeError(f"REST accounts failed, HTTP {resp.status_code}: {resp.text[:400]}")
-    payload = resp.json()
-    # Expect a list of accounts with 'id' and 'from_email' keys
-    # Some tenants use 'email' instead of 'from_email', handle both.
-    out = []
-    for r in payload if isinstance(payload, list) else payload.get("data", []):
-        from_email = r.get("from_email") or r.get("email")
-        out.append({
-            "id": r.get("id"),
-            "from_email": from_email
-        })
-    return out
-
-def fetch_tags_graphql(query: str,
-                       root: str,
-                       id_field: str,
-                       name_field: str) -> List[Dict]:
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {SMARTLEAD_BEARER}",
-    }
-    resp = _http_post(GRAPHQL_URL, headers, {"query": query})
-    if resp.status_code != 200:
-        raise RuntimeError(f"GraphQL tags query failed, HTTP {resp.status_code}: {resp.text[:400]}")
-    payload = resp.json()
-    if "errors" in payload:
-        raise RuntimeError(f"GraphQL tags error: {payload['errors']}")
-    data = payload.get("data", {})
-    rows = data.get(root, [])
-    out = []
-    for r in rows:
-        out.append({
-            "id": r.get(id_field),
-            "name": r.get(name_field)
-        })
-    return out
-
-def apply_tags_batch(email_ids: List[int], tag_id: int) -> Tuple[bool, str]:
-    if not SMARTLEAD_API_KEY:
-        return False, "SMARTLEAD_API_KEY is missing"
-    url = f"{REST_TAG_MAPPING_URL}?api_key={SMARTLEAD_API_KEY}"
-    body = {
-        "email_account_ids": email_ids,
-        "tag_ids": [tag_id],
-    }
-    resp = requests.post(url, json=body, timeout=30)
-    if 200 <= resp.status_code < 300:
-        return True, ""
-    try:
-        err = resp.json().get("message")
-    except Exception:
-        err = resp.text[:300]
-    return False, f"HTTP {resp.status_code}: {err}"
-
-def normalize_email(s: str) -> str:
-    return (s or "").strip().lower()
-
-def normalize_tag(s: str) -> str:
-    return (s or "").strip().lower()
+# -------------------- Utils --------------------
+def trim(s: str) -> str:
+    return (s or "").strip()
 
 def robust_read_csv(upload: bytes) -> pd.DataFrame:
-    # Guess encoding
     enc = "utf-8"
-    if CHARDET_DETECT:
-        try:
-            det = CHARDET_DETECT(upload)
-            if det and det.get("encoding"):
-                enc = det["encoding"]
-        except Exception:
-            enc = "utf-8"
-
-    # Try separators in order
+    try:
+        det = chardet.detect(upload)
+        if det and det.get("encoding"):
+            enc = det["encoding"]
+    except Exception:
+        pass
     seps = [",", ";", "\t", "|"]
-    last_err = None
     for sep in seps:
         try:
             df = pd.read_csv(io.BytesIO(upload), encoding=enc, sep=sep, engine="python")
             if df.shape[1] >= 2:
                 return df
-        except Exception as e:
-            last_err = e
+        except Exception:
             continue
-    # Fallback without sep
-    try:
-        return pd.read_csv(io.BytesIO(upload), encoding=enc, engine="python")
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse CSV. Last error: {last_err or e}")
+    return pd.read_csv(io.BytesIO(upload), encoding=enc, engine="python")
 
-st.subheader("1. Upload CSV and map columns")
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_email_accounts_graphql_cached(bearer: str) -> List[Dict]:
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {bearer}"}
+    q = "query { email_accounts { id from_email } }"
+    resp = requests.post(GRAPHQL_URL, headers=headers, json={"query": q}, timeout=60)
+    resp.raise_for_status()
+    payload = resp.json()
+    rows = payload["data"]["email_accounts"]
+    out = []
+    for r in rows:
+        if r.get("id") is None or r.get("from_email") in (None, ""):
+            continue
+        out.append({"id": int(r["id"]), "from_email": r["from_email"]})
+    return out
 
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
-if uploaded is not None:
-    raw_bytes = uploaded.read()
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_tags_graphql_cached(bearer: str) -> List[Dict]:
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {bearer}"}
+    q = "query { tags { id name } }"
+    resp = requests.post(GRAPHQL_URL, headers=headers, json={"query": q}, timeout=60)
+    resp.raise_for_status()
+    payload = resp.json()
+    rows = payload["data"]["tags"]
+    out = []
+    for r in rows:
+        if r.get("id") is None or r.get("name") in (None, ""):
+            continue
+        out.append({"id": int(r["id"]), "name": r["name"]})
+    return out
+
+def apply_tags_batch(email_ids: List[int], tag_id: int) -> Tuple[bool, str]:
+    if not SMARTLEAD_API_KEY:
+        return False, "SMARTLEAD_API_KEY missing"
+    url = f"{REST_TAG_MAPPING_URL}?api_key={SMARTLEAD_API_KEY}"
+    body = {"email_account_ids": email_ids, "tag_ids": [tag_id]}
+    resp = requests.post(url, json=body, timeout=60)
+    if 200 <= resp.status_code < 300:
+        return True, ""
     try:
-        df_raw = robust_read_csv(raw_bytes)
+        return False, resp.json().get("message", resp.text[:300])
+    except Exception:
+        return False, resp.text[:300]
+
+# -------------------- Session State --------------------
+if "mapped_df" not in st.session_state:
+    st.session_state.mapped_df = None
+if "mapping_ready" not in st.session_state:
+    st.session_state.mapping_ready = False
+if "last_summary" not in st.session_state:
+    st.session_state.last_summary = None
+if "last_logs_df" not in st.session_state:
+    st.session_state.last_logs_df = None
+if "results_df" not in st.session_state:
+    st.session_state.results_df = None
+
+# -------------------- Upload and column mapping --------------------
+uploaded = st.file_uploader("Upload CSV", type=["csv"], key="uploader")
+if uploaded:
+    raw = uploaded.read()
+    try:
+        df_raw = robust_read_csv(raw)
     except Exception as e:
-        st.error(str(e))
+        st.error(f"Failed to parse CSV: {e}")
         st.stop()
+    st.caption("Preview")
+    st.dataframe(df_raw.head(20), use_container_width=True)
 
-    st.write("Preview:")
-    st.dataframe(df_raw.head(20))
+    email_col = st.selectbox("Column for email", df_raw.columns, index=0, key="email_col")
+    tag_col = st.selectbox("Column for tag", df_raw.columns, index=1 if len(df_raw.columns) > 1 else 0, key="tag_col")
+    case_insensitive = st.checkbox("Case-insensitive tag matching", value=False, key="case_toggle")
 
-    cols = list(df_raw.columns)
-    email_col = st.selectbox("Select the column for email", options=cols, index=0)
-    tag_col = st.selectbox("Select the column for tag", options=cols, index=1 if len(cols) > 1 else 0)
-
-    # Build minimal working frame
-    df = pd.DataFrame({
-        "email": df_raw[email_col].astype(str).map(normalize_email),
-        "tag": df_raw[tag_col].astype(str).map(normalize_tag),
-    })
-
-    st.subheader("2. Fetch Smartlead data and map IDs")
-
-    run_mapping = st.button("Fetch and Map")
-    if run_mapping:
+    if st.button("Fetch and Map", key="fetch_map_btn"):
         if not SMARTLEAD_BEARER:
-            st.error(
-                "SMARTLEAD_BEARER secret is required before fetching Smartlead accounts and tags. "
-                "Add it to .streamlit/secrets.toml and try again."
-            )
+            st.error("SMARTLEAD_BEARER is missing in secrets.")
             st.stop()
+        with st.spinner("Fetching Smartlead accounts and tags"):
+            accounts = fetch_email_accounts_graphql_cached(SMARTLEAD_BEARER)
+            tags = fetch_tags_graphql_cached(SMARTLEAD_BEARER)
 
-        with st.spinner("Fetching accounts and tags from Smartlead"):
-            errors = []
+        email_to_id = {trim(a["from_email"]).lower(): a["id"] for a in accounts}
+        # Tag dicts
+        if case_insensitive:
+            tag_to_id = {trim(t["name"]).lower(): t["id"] for t in tags}
+        else:
+            tag_to_id = {trim(t["name"]): t["id"] for t in tags}
 
-            # Accounts
-            accounts = []
-            try:
-                accounts = fetch_email_accounts_graphql(
-                    default_accounts_query, accounts_root, accounts_id_field, accounts_email_field
-                )
-            except Exception as e:
-                if use_rest_accounts_fallback:
-                    try:
-                        accounts = fetch_email_accounts_rest()
-                    except Exception as e2:
-                        errors.append(f"Accounts fetch failed: {e2}")
+        # Build working DF with nullable Int64 ids and pd.NA for missing
+        email_series = df_raw[email_col].astype(str).map(trim).str.lower()
+        tag_series_user = df_raw[tag_col].astype(str).map(trim)
+        tag_key_series = tag_series_user.str.lower() if case_insensitive else tag_series_user
+
+        email_ids = email_series.map(email_to_id).astype("Int64")
+        tag_ids = tag_key_series.map(tag_to_id).astype("Int64")
+
+        df = pd.DataFrame({
+            "email": email_series,  # lower normalized for match, but keep original below
+            "email_original": df_raw[email_col].astype(str).map(trim),
+            "tag": tag_series_user,  # preserve exact case the user provided
+            "email_account_id": email_ids,
+            "tag_id": tag_ids
+        })
+
+        st.session_state.mapped_df = df
+        st.session_state.mapping_ready = True
+        st.session_state.last_summary = None
+        st.session_state.last_logs_df = None
+        st.session_state.results_df = None
+        st.success("Mapping complete")
+
+# -------------------- Review and export mapping --------------------
+if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
+    st.subheader("Mapped data")
+    show_df = st.session_state.mapped_df.copy()
+    st.dataframe(show_df.head(50), use_container_width=True)
+
+    st.download_button(
+        "Download mapped CSV",
+        st.session_state.mapped_df.to_csv(index=False, na_rep="n/a").encode("utf-8"),
+        file_name="mapped_emails_tags.csv",
+        mime="text/csv",
+        key="download_mapped_btn",
+    )
+
+# -------------------- Apply step --------------------
+if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
+    st.subheader("Apply tags to Smartlead accounts")
+    dry_run = st.checkbox("Dry run, do not call API", value=True, key="dry_run_checkbox")
+    apply_clicked = st.button("Apply Tags Now", key="apply_btn")
+
+    if apply_clicked:
+        df = st.session_state.mapped_df.copy()
+
+        # Build per-row result template
+        results = df[["email_original", "email", "tag", "email_account_id", "tag_id"]].copy()
+        results["status"] = pd.Series([""] * len(results), dtype="string")
+        results["error"] = pd.Series([""] * len(results), dtype="string")
+
+        # Reasons for skipped
+        mask_no_account = results["email_account_id"].isna()
+        mask_no_tag = results["tag_id"].isna()
+
+        results.loc[mask_no_account & ~mask_no_tag, "status"] = "SKIPPED_NO_ACCOUNT"
+        results.loc[mask_no_tag & ~mask_no_account, "status"] = "SKIPPED_NO_TAG"
+        results.loc[mask_no_tag & mask_no_account, "status"] = "SKIPPED_NO_ACCOUNT_AND_TAG"
+
+        valid = results[~mask_no_account & ~mask_no_tag].copy()
+
+        # Batch apply
+        total_batches = sum((len(sub) + EMAIL_BATCH_LIMIT - 1) // EMAIL_BATCH_LIMIT for _, sub in valid.groupby("tag_id"))
+        progress = st.progress(0)
+        done_batches = 0
+
+        logs = []  # list of dicts for DataFrame
+
+        applied = 0
+        errors = 0
+        for tag_id, sub in valid.groupby("tag_id"):
+            ids = sub["email_account_id"].astype(int).tolist()
+            for i in range(0, len(ids), EMAIL_BATCH_LIMIT):
+                batch = ids[i:i+EMAIL_BATCH_LIMIT]
+                if dry_run:
+                    batch_status = "SKIPPED_DRY_RUN"
+                    ok = True
+                    err_msg = ""
                 else:
-                    errors.append(f"Accounts fetch failed: {e}")
+                    ok, err_msg = apply_tags_batch(batch, int(tag_id))
+                    batch_status = "APPLIED" if ok else "FAILED"
 
-            # Tags
-            tags = []
-            try:
-                tags = fetch_tags_graphql(
-                    default_tags_query, tags_root, tags_id_field, tags_name_field
-                )
-            except Exception as e:
-                errors.append(f"Tags fetch failed: {e}")
+                # Mark per-row statuses for this batch
+                rows_idx = sub.index[i:i+EMAIL_BATCH_LIMIT]
+                if ok:
+                    results.loc[rows_idx, "status"] = "APPLIED"
+                    applied += len(rows_idx)
+                else:
+                    results.loc[rows_idx, "status"] = "FAILED"
+                    results.loc[rows_idx, "error"] = err_msg
+                    errors += len(rows_idx)
 
-            if errors:
-                for err in errors:
-                    st.error(err)
-                st.stop()
+                logs.append({"tag_id": int(tag_id), "batch_size": len(batch), "status": batch_status, "error": err_msg})
 
-            # Build lookup maps
-            email_to_id = {}
-            for a in accounts:
-                em = normalize_email(a.get("from_email"))
-                if em and a.get("id") is not None:
-                    email_to_id[em] = a["id"]
+                done_batches += 1
+                progress.progress(min(done_batches / max(total_batches, 1), 1.0))
 
-            tag_to_id = {}
-            collisions = []
-            for t in tags:
-                name = normalize_tag(t.get("name"))
-                tid = t.get("id")
-                if not name or tid is None:
-                    continue
-                if name in tag_to_id and tag_to_id[name] != tid:
-                    collisions.append(name)
-                tag_to_id[name] = tid
+        skipped_accounts = int((mask_no_account & ~mask_no_tag).sum())
+        skipped_tags = int((mask_no_tag & ~mask_no_account).sum())
+        skipped_both = int((mask_no_tag & mask_no_account).sum())
 
-            if collisions:
-                st.warning(f"Detected duplicate tag names after normalization: {sorted(set(collisions))}")
+        summary = {
+            "applied": applied,
+            "skipped_accounts": skipped_accounts,
+            "skipped_tags": skipped_tags,
+            "skipped_both": skipped_both,
+            "errors": errors,
+            "total_rows": int(len(results)),
+            "total_batches": int(total_batches),
+        }
 
-            # Map onto df
-            df["email_account_id"] = df["email"].map(email_to_id).fillna("n/a")
-            df["tag_id"] = df["tag"].map(tag_to_id).fillna("n/a")
+        st.session_state.last_summary = summary
+        st.session_state.last_logs_df = pd.DataFrame(logs)
+        st.session_state.results_df = results
 
-            st.session_state["mapped_df"] = df
-            st.success("Mapping complete")
+# -------------------- Results and exports --------------------
+if st.session_state.last_summary is not None:
+    st.success("Apply step completed")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Applied", st.session_state.last_summary["applied"])
+    c2.metric("Skipped accounts", st.session_state.last_summary["skipped_accounts"])
+    c3.metric("Skipped tags", st.session_state.last_summary["skipped_tags"])
+    c4.metric("Skipped both", st.session_state.last_summary["skipped_both"])
+    c5.metric("Errors", st.session_state.last_summary["errors"])
+    c6.metric("Total rows", st.session_state.last_summary["total_rows"])
+    st.caption(f"Batches processed: {st.session_state.last_summary['total_batches']}")
 
-    mapped_df = st.session_state.get("mapped_df")
-    if mapped_df is not None:
-        st.dataframe(mapped_df.head(50))
+    with st.expander("Batch logs"):
+        st.dataframe(st.session_state.last_logs_df, use_container_width=True)
 
-        # Provide CSV download
-        out_csv = mapped_df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download mapped CSV", data=out_csv, file_name="mapped_emails_tags.csv", mime="text/csv")
+    st.subheader("Per-row results")
+    st.dataframe(st.session_state.results_df.head(200), use_container_width=True)
 
-        st.subheader("3. Apply tags to Smartlead accounts, optional")
-
-        dry_run = st.checkbox("Dry run, do not call API", value=True)
-        go_apply = st.button("Apply Tags")
-
-        if go_apply:
-            if dry_run:
-                st.info("Dry run enabled, not calling tag-mapping endpoint")
-            else:
-                if not SMARTLEAD_API_KEY:
-                    st.error(
-                        "SMARTLEAD_API_KEY secret is required to apply tags. "
-                        "Add it to .streamlit/secrets.toml and try again."
-                    )
-                    st.stop()
-
-            # Group by tag_id, then apply in batches to valid email ids
-            action_logs = []
-            valid = mapped_df[(mapped_df["email_account_id"] != "n/a") & (mapped_df["tag_id"] != "n/a")]
-            invalid_rows = mapped_df[(mapped_df["email_account_id"] == "n/a") | (mapped_df["tag_id"] == "n/a")]
-
-            if not invalid_rows.empty:
-                st.warning(f"{len(invalid_rows)} rows have n/a for email_account_id or tag_id. These are skipped.")
-
-            grouped = valid.groupby("tag_id")
-            total_ok = 0
-            total_fail = 0
-
-            for tag_id, sub in grouped:
-                ids = [int(x) for x in sub["email_account_id"].tolist()]
-                # batch
-                for i in range(0, len(ids), EMAIL_BATCH_LIMIT):
-                    batch = ids[i:i+EMAIL_BATCH_LIMIT]
-                    if dry_run:
-                        action_logs.append({"tag_id": int(tag_id), "batch_count": len(batch), "status": "SKIPPED, dry run"})
-                        continue
-                    ok, err = apply_tags_batch(batch, int(tag_id))
-                    if ok:
-                        total_ok += len(batch)
-                        action_logs.append({"tag_id": int(tag_id), "batch_count": len(batch), "status": "APPLIED"})
-                    else:
-                        total_fail += len(batch)
-                        action_logs.append({"tag_id": int(tag_id), "batch_count": len(batch), "status": f"FAILED, {err}"})
-
-            log_df = pd.DataFrame(action_logs)
-            st.write("Action log:")
-            st.dataframe(log_df)
-
-            st.success(f"Done. Applied: {total_ok}, Failed: {total_fail}")
-
-else:
-    st.info("Upload a CSV to begin")
+    st.download_button(
+        "Download results CSV",
+        st.session_state.results_df.to_csv(index=False, na_rep="n/a").encode("utf-8"),
+        file_name="smartlead_tag_apply_results.csv",
+        mime="text/csv",
+        key="download_results_btn",
+    )
