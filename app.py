@@ -4,7 +4,12 @@ import json
 import time
 from typing import Dict, List, Tuple, Optional
 
-import chardet
+try:
+    import chardet  # type: ignore
+    CHARDET_DETECT = chardet.detect
+except ImportError:  # pragma: no cover - optional dependency
+    chardet = None  # type: ignore
+    CHARDET_DETECT = None
 import numpy as np
 import pandas as pd
 import requests
@@ -168,12 +173,13 @@ def normalize_tag(s: str) -> str:
 def robust_read_csv(upload: bytes) -> pd.DataFrame:
     # Guess encoding
     enc = "utf-8"
-    try:
-        det = chardet.detect(upload)
-        if det and det.get("encoding"):
-            enc = det["encoding"]
-    except Exception:
-        enc = "utf-8"
+    if CHARDET_DETECT:
+        try:
+            det = CHARDET_DETECT(upload)
+            if det and det.get("encoding"):
+                enc = det["encoding"]
+        except Exception:
+            enc = "utf-8"
 
     # Try separators in order
     seps = [",", ";", "\t", "|"]
