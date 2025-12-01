@@ -16,7 +16,7 @@ SMARTLEAD_BEARER = st.secrets.get("SMARTLEAD_BEARER", "").strip()
 SMARTLEAD_API_KEY = st.secrets.get("SMARTLEAD_API_KEY", "").strip()
 
 st.set_page_config(page_title="Smartlead Tag Mapper", page_icon="🔖", layout="wide")
-st.title("Smartlead Tag Mapper v4")
+st.title("Smartlead Tag Mapper v5")
 
 # -------------------- Utils --------------------
 def trim(s: str) -> str:
@@ -39,6 +39,12 @@ def robust_read_csv(upload: bytes) -> pd.DataFrame:
         except Exception:
             continue
     return pd.read_csv(io.BytesIO(upload), encoding=enc, engine="python")
+
+
+def extract_domain(email: str) -> str:
+    if "@" not in email:
+        return ""
+    return email.split("@", 1)[1]
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_email_accounts_graphql_cached(bearer: str) -> List[Dict]:
@@ -107,7 +113,13 @@ if uploaded:
     st.caption("Preview")
     st.dataframe(df_raw.head(20), use_container_width=True)
 
-    email_col = st.selectbox("Column for email", df_raw.columns, index=0, key="email_col")
+    identifier_col = st.selectbox(
+        "Column for email or domain",
+        df_raw.columns,
+        index=0,
+        key="identifier_col",
+        help="If a value contains '@', it's treated as an email. Otherwise it is treated as a domain."
+    )
     tag_col = st.selectbox("Column for tag", df_raw.columns, index=1 if len(df_raw.columns) > 1 else 0, key="tag_col")
     case_insensitive = st.checkbox("Case-insensitive tag matching", value=False, key="case_toggle")
 
@@ -120,6 +132,14 @@ if uploaded:
             tags = fetch_tags_graphql_cached(SMARTLEAD_BEARER)
 
         email_to_id = {trim(a["from_email"]).lower(): a["id"] for a in accounts}
+        email_to_raw = {trim(a["from_email"]).lower(): a["from_email"] for a in accounts}
+        domain_to_accounts = {}
+        for acc in accounts:
+            normalized_email = trim(acc["from_email"]).lower()
+            domain = extract_domain(normalized_email)
+            if not domain:
+                continue
+            domain_to_accounts.setdefault(domain, []).append({"id": acc["id"], "from_email": acc["from_email"]})
         # Tag dicts
         if case_insensitive:
             tag_to_id = {trim(t["name"]).lower(): t["id"] for t in tags}
@@ -127,20 +147,58 @@ if uploaded:
             tag_to_id = {trim(t["name"]): t["id"] for t in tags}
 
         # Build working DF with nullable Int64 ids and pd.NA for missing
-        email_series = df_raw[email_col].astype(str).map(trim).str.lower()
+        identifier_series = df_raw[identifier_col].astype(str).map(trim)
+        identifier_norm = identifier_series.str.lower()
         tag_series_user = df_raw[tag_col].astype(str).map(trim)
         tag_key_series = tag_series_user.str.lower() if case_insensitive else tag_series_user
-
-        email_ids = email_series.map(email_to_id).astype("Int64")
         tag_ids = tag_key_series.map(tag_to_id).astype("Int64")
 
-        df = pd.DataFrame({
-            "email": email_series,  # lower normalized for match, but keep original below
-            "email_original": df_raw[email_col].astype(str).map(trim),
-            "tag": tag_series_user,  # preserve exact case the user provided
-            "email_account_id": email_ids,
-            "tag_id": tag_ids
-        })
+        rows = []
+        for idx, ident in identifier_norm.items():
+            raw_ident = identifier_series.iloc[idx]
+            tag_value = tag_series_user.iloc[idx]
+            tag_id_value = tag_ids.iloc[idx]
+            tag_id_for_row = pd.NA if pd.isna(tag_id_value) else int(tag_id_value)
+
+            if "@" in ident:
+                email_id = email_to_id.get(ident)
+                email_original = email_to_raw.get(ident, raw_ident)
+                rows.append({
+                    "input_value": raw_ident,
+                    "input_type": "email",
+                    "email": ident,
+                    "email_original": email_original,
+                    "tag": tag_value,
+                    "email_account_id": pd.NA if email_id is None else int(email_id),
+                    "tag_id": tag_id_for_row,
+                })
+            else:
+                domain_matches = domain_to_accounts.get(ident, [])
+                if domain_matches:
+                    for acc in domain_matches:
+                        rows.append({
+                            "input_value": raw_ident,
+                            "input_type": "domain",
+                            "email": trim(acc["from_email"]).lower(),
+                            "email_original": acc["from_email"],
+                            "tag": tag_value,
+                            "email_account_id": int(acc["id"]),
+                            "tag_id": tag_id_for_row,
+                        })
+                else:
+                    rows.append({
+                        "input_value": raw_ident,
+                        "input_type": "domain",
+                        "email": "",
+                        "email_original": "",
+                        "tag": tag_value,
+                        "email_account_id": pd.NA,
+                        "tag_id": tag_id_for_row,
+                    })
+
+        df = pd.DataFrame(rows)
+        df["email_account_id"] = pd.to_numeric(df["email_account_id"], errors="coerce").astype("Int64")
+        df["tag_id"] = pd.to_numeric(df["tag_id"], errors="coerce").astype("Int64")
 
         st.session_state.mapped_df = df
         st.session_state.mapping_ready = True
@@ -173,7 +231,7 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
         df = st.session_state.mapped_df.copy()
 
         # Build per-row result template
-        results = df[["email_original", "email", "tag", "email_account_id", "tag_id"]].copy()
+        results = df[["input_value", "input_type", "email_original", "email", "tag", "email_account_id", "tag_id"]].copy()
         results["status"] = pd.Series([""] * len(results), dtype="string")
         results["error"] = pd.Series([""] * len(results), dtype="string")
 
