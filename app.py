@@ -16,7 +16,7 @@ SMARTLEAD_BEARER = st.secrets.get("SMARTLEAD_BEARER", "").strip()
 SMARTLEAD_API_KEY = st.secrets.get("SMARTLEAD_API_KEY", "").strip()
 
 st.set_page_config(page_title="Smartlead Tag Mapper", page_icon="🔖", layout="wide")
-st.title("Smartlead Tag Mapper v6")
+st.title("Smartlead Tag Mapper v7")
 
 # -------------------- Utils --------------------
 def trim(s: str) -> str:
@@ -90,43 +90,8 @@ def apply_tags_batch(email_ids: List[int], tag_id: int) -> Tuple[bool, str]:
         return False, resp.text[:300]
 
 
-@st.cache_data(show_spinner=False, ttl=300)
-def fetch_email_account_tag_mappings_graphql_cached(bearer: str) -> Dict[int, List[int]]:
-    """
-    Returns mapping of email_account_id -> list of tag_ids currently mapped on Smartlead.
-    """
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {bearer}"}
-    q = """
-    query GetEmailAccountTagMappings {
-      email_accounts {
-        id
-        email_account_tags {
-          tag_id
-        }
-      }
-    }
-    """
-    resp = requests.post(GRAPHQL_URL, headers=headers, json={"query": q}, timeout=90)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    if payload.get("errors"):
-        raise ValueError(payload.get("errors"))
-
-    rows = payload.get("data", {}).get("email_accounts", [])
-    out: Dict[int, List[int]] = {}
-    for row in rows:
-        if row.get("id") is None:
-            continue
-        account_id = int(row["id"])
-        tag_rows = row.get("email_account_tags") or []
-        tag_ids = []
-        for tag_row in tag_rows:
-            if tag_row.get("tag_id") is None:
-                continue
-            tag_ids.append(int(tag_row["tag_id"]))
-        out[account_id] = sorted(list(set(tag_ids)))
-    return out
+def split_csv_tags(raw_tag_value: str) -> List[str]:
+    return [t for t in (trim(x) for x in str(raw_tag_value or "").split(",")) if t]
 
 
 def remove_tags_batch(email_ids: List[int], tag_ids: List[int]) -> Tuple[bool, str, Dict]:
@@ -211,51 +176,59 @@ if uploaded:
         identifier_series = df_raw[identifier_col].astype(str).map(trim)
         identifier_norm = identifier_series.str.lower()
         tag_series_user = df_raw[tag_col].astype(str).map(trim)
-        tag_key_series = tag_series_user.str.lower() if case_insensitive else tag_series_user
-        tag_ids = tag_key_series.map(tag_to_id).astype("Int64")
 
         rows = []
         for idx, ident in identifier_norm.items():
             raw_ident = identifier_series.iloc[idx]
-            tag_value = tag_series_user.iloc[idx]
-            tag_id_value = tag_ids.iloc[idx]
-            tag_id_for_row = pd.NA if pd.isna(tag_id_value) else int(tag_id_value)
+            raw_tag_cell = tag_series_user.iloc[idx]
+            tag_values = split_csv_tags(raw_tag_cell)
+            if not tag_values:
+                tag_values = [""]
 
             if "@" in ident:
                 email_id = email_to_id.get(ident)
                 email_original = email_to_raw.get(ident, raw_ident)
-                rows.append({
-                    "input_value": raw_ident,
-                    "input_type": "email",
-                    "email": ident,
-                    "email_original": email_original,
-                    "tag": tag_value,
-                    "email_account_id": pd.NA if email_id is None else int(email_id),
-                    "tag_id": tag_id_for_row,
-                })
+                for tag_value in tag_values:
+                    tag_key = tag_value.lower() if case_insensitive else tag_value
+                    mapped_tag_id = tag_to_id.get(tag_key)
+                    rows.append({
+                        "input_value": raw_ident,
+                        "input_type": "email",
+                        "email": ident,
+                        "email_original": email_original,
+                        "tag": tag_value,
+                        "email_account_id": pd.NA if email_id is None else int(email_id),
+                        "tag_id": pd.NA if mapped_tag_id is None else int(mapped_tag_id),
+                    })
             else:
                 domain_matches = domain_to_accounts.get(ident, [])
                 if domain_matches:
                     for acc in domain_matches:
+                        for tag_value in tag_values:
+                            tag_key = tag_value.lower() if case_insensitive else tag_value
+                            mapped_tag_id = tag_to_id.get(tag_key)
+                            rows.append({
+                                "input_value": raw_ident,
+                                "input_type": "domain",
+                                "email": trim(acc["from_email"]).lower(),
+                                "email_original": acc["from_email"],
+                                "tag": tag_value,
+                                "email_account_id": int(acc["id"]),
+                                "tag_id": pd.NA if mapped_tag_id is None else int(mapped_tag_id),
+                            })
+                else:
+                    for tag_value in tag_values:
+                        tag_key = tag_value.lower() if case_insensitive else tag_value
+                        mapped_tag_id = tag_to_id.get(tag_key)
                         rows.append({
                             "input_value": raw_ident,
                             "input_type": "domain",
-                            "email": trim(acc["from_email"]).lower(),
-                            "email_original": acc["from_email"],
+                            "email": "",
+                            "email_original": "",
                             "tag": tag_value,
-                            "email_account_id": int(acc["id"]),
-                            "tag_id": tag_id_for_row,
+                            "email_account_id": pd.NA,
+                            "tag_id": pd.NA if mapped_tag_id is None else int(mapped_tag_id),
                         })
-                else:
-                    rows.append({
-                        "input_value": raw_ident,
-                        "input_type": "domain",
-                        "email": "",
-                        "email_original": "",
-                        "tag": tag_value,
-                        "email_account_id": pd.NA,
-                        "tag_id": tag_id_for_row,
-                    })
 
         df = pd.DataFrame(rows)
         df["email_account_id"] = pd.to_numeric(df["email_account_id"], errors="coerce").astype("Int64")
@@ -364,50 +337,40 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
                 st.stop()
 
             account_ids_to_overwrite = sorted(valid_pairs["email_account_id"].unique().tolist())
-            with st.spinner("Fetching existing account-tag mappings for overwrite phase"):
+            with st.spinner("Preparing overwrite delete phase"):
                 try:
-                    account_to_existing_tags = fetch_email_account_tag_mappings_graphql_cached(SMARTLEAD_BEARER)
+                    all_tags = fetch_tags_graphql_cached(SMARTLEAD_BEARER)
                 except Exception as e:
-                    st.error(f"Failed to fetch existing tag mappings for overwrite: {e}")
+                    st.error(f"Failed to fetch tags for overwrite: {e}")
                     st.stop()
 
-            overwrite_plan = {}
-            for aid in account_ids_to_overwrite:
-                existing_tags = account_to_existing_tags.get(int(aid), [])
-                if existing_tags:
-                    overwrite_plan[int(aid)] = sorted(list(set(int(t) for t in existing_tags)))
+            all_tag_ids = sorted(list(set(int(t["id"]) for t in all_tags if t.get("id") is not None)))
+            if not all_tag_ids:
+                st.error("No tags found in Smartlead; cannot run overwrite delete phase.")
+                st.stop()
 
-            planned_pairs = sum(len(tag_ids) for tag_ids in overwrite_plan.values())
+            planned_pairs = len(account_ids_to_overwrite) * len(all_tag_ids)
             delete_summary["processed"] = int(planned_pairs)
 
             if dry_run:
                 delete_summary["skipped"] = int(planned_pairs)
-                for aid, tids in overwrite_plan.items():
+                for i in range(0, len(account_ids_to_overwrite), EMAIL_BATCH_LIMIT):
+                    account_batch = account_ids_to_overwrite[i:i + EMAIL_BATCH_LIMIT]
                     delete_logs.append(
                         {
                             "phase": "DELETE",
-                            "email_account_id": aid,
-                            "tag_ids": ",".join(str(t) for t in tids),
-                            "batch_size": 1,
+                            "email_account_id": ",".join(str(a) for a in account_batch),
+                            "tag_ids": ",".join(str(t) for t in all_tag_ids),
+                            "batch_size": len(account_batch),
                             "status": "SIMULATED_DELETE",
                             "error": "",
                         }
                     )
+                    delete_summary["batches"] += 1
             else:
                 for i in range(0, len(account_ids_to_overwrite), EMAIL_BATCH_LIMIT):
                     account_batch = account_ids_to_overwrite[i:i + EMAIL_BATCH_LIMIT]
-                    tag_union = sorted(
-                        list(
-                            set(
-                                tag_id
-                                for account_id in account_batch
-                                for tag_id in overwrite_plan.get(account_id, [])
-                            )
-                        )
-                    )
-                    if not tag_union:
-                        continue
-
+                    tag_union = all_tag_ids
                     ok, err_msg, resp_json = remove_tags_batch(account_batch, tag_union)
                     delete_summary["batches"] += 1
                     if not ok:
