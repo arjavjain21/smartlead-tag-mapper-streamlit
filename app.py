@@ -16,7 +16,7 @@ SMARTLEAD_BEARER = st.secrets.get("SMARTLEAD_BEARER", "").strip()
 SMARTLEAD_API_KEY = st.secrets.get("SMARTLEAD_API_KEY", "").strip()
 
 st.set_page_config(page_title="Smartlead Tag Mapper", page_icon="🔖", layout="wide")
-st.title("Smartlead Tag Mapper v5")
+st.title("Smartlead Tag Mapper v7")
 
 # -------------------- Utils --------------------
 def trim(s: str) -> str:
@@ -89,6 +89,30 @@ def apply_tags_batch(email_ids: List[int], tag_id: int) -> Tuple[bool, str]:
     except Exception:
         return False, resp.text[:300]
 
+
+def split_csv_tags(raw_tag_value: str) -> List[str]:
+    return [t for t in (trim(x) for x in str(raw_tag_value or "").split(",")) if t]
+
+
+def remove_tags_batch(email_ids: List[int], tag_ids: List[int]) -> Tuple[bool, str, Dict]:
+    if not SMARTLEAD_API_KEY:
+        return False, "SMARTLEAD_API_KEY missing", {}
+    if not email_ids or not tag_ids:
+        return True, "", {"success": True, "data": {"results": [], "summary": {}}}
+
+    url = f"{REST_TAG_MAPPING_URL}?api_key={SMARTLEAD_API_KEY}"
+    body = {"email_account_ids": email_ids, "tag_ids": tag_ids}
+    resp = requests.delete(url, json=body, timeout=90)
+    if 200 <= resp.status_code < 300:
+        try:
+            return True, "", resp.json()
+        except Exception:
+            return True, "", {"success": True, "data": {"results": [], "summary": {}}}
+    try:
+        return False, resp.json().get("message", resp.text[:300]), {}
+    except Exception:
+        return False, resp.text[:300], {}
+
 # -------------------- Session State --------------------
 if "mapped_df" not in st.session_state:
     st.session_state.mapped_df = None
@@ -100,6 +124,8 @@ if "last_logs_df" not in st.session_state:
     st.session_state.last_logs_df = None
 if "results_df" not in st.session_state:
     st.session_state.results_df = None
+if "last_phase_summaries" not in st.session_state:
+    st.session_state.last_phase_summaries = None
 
 # -------------------- Upload and column mapping --------------------
 uploaded = st.file_uploader("Upload CSV", type=["csv"], key="uploader")
@@ -150,51 +176,59 @@ if uploaded:
         identifier_series = df_raw[identifier_col].astype(str).map(trim)
         identifier_norm = identifier_series.str.lower()
         tag_series_user = df_raw[tag_col].astype(str).map(trim)
-        tag_key_series = tag_series_user.str.lower() if case_insensitive else tag_series_user
-        tag_ids = tag_key_series.map(tag_to_id).astype("Int64")
 
         rows = []
         for idx, ident in identifier_norm.items():
             raw_ident = identifier_series.iloc[idx]
-            tag_value = tag_series_user.iloc[idx]
-            tag_id_value = tag_ids.iloc[idx]
-            tag_id_for_row = pd.NA if pd.isna(tag_id_value) else int(tag_id_value)
+            raw_tag_cell = tag_series_user.iloc[idx]
+            tag_values = split_csv_tags(raw_tag_cell)
+            if not tag_values:
+                tag_values = [""]
 
             if "@" in ident:
                 email_id = email_to_id.get(ident)
                 email_original = email_to_raw.get(ident, raw_ident)
-                rows.append({
-                    "input_value": raw_ident,
-                    "input_type": "email",
-                    "email": ident,
-                    "email_original": email_original,
-                    "tag": tag_value,
-                    "email_account_id": pd.NA if email_id is None else int(email_id),
-                    "tag_id": tag_id_for_row,
-                })
+                for tag_value in tag_values:
+                    tag_key = tag_value.lower() if case_insensitive else tag_value
+                    mapped_tag_id = tag_to_id.get(tag_key)
+                    rows.append({
+                        "input_value": raw_ident,
+                        "input_type": "email",
+                        "email": ident,
+                        "email_original": email_original,
+                        "tag": tag_value,
+                        "email_account_id": pd.NA if email_id is None else int(email_id),
+                        "tag_id": pd.NA if mapped_tag_id is None else int(mapped_tag_id),
+                    })
             else:
                 domain_matches = domain_to_accounts.get(ident, [])
                 if domain_matches:
                     for acc in domain_matches:
+                        for tag_value in tag_values:
+                            tag_key = tag_value.lower() if case_insensitive else tag_value
+                            mapped_tag_id = tag_to_id.get(tag_key)
+                            rows.append({
+                                "input_value": raw_ident,
+                                "input_type": "domain",
+                                "email": trim(acc["from_email"]).lower(),
+                                "email_original": acc["from_email"],
+                                "tag": tag_value,
+                                "email_account_id": int(acc["id"]),
+                                "tag_id": pd.NA if mapped_tag_id is None else int(mapped_tag_id),
+                            })
+                else:
+                    for tag_value in tag_values:
+                        tag_key = tag_value.lower() if case_insensitive else tag_value
+                        mapped_tag_id = tag_to_id.get(tag_key)
                         rows.append({
                             "input_value": raw_ident,
                             "input_type": "domain",
-                            "email": trim(acc["from_email"]).lower(),
-                            "email_original": acc["from_email"],
+                            "email": "",
+                            "email_original": "",
                             "tag": tag_value,
-                            "email_account_id": int(acc["id"]),
-                            "tag_id": tag_id_for_row,
+                            "email_account_id": pd.NA,
+                            "tag_id": pd.NA if mapped_tag_id is None else int(mapped_tag_id),
                         })
-                else:
-                    rows.append({
-                        "input_value": raw_ident,
-                        "input_type": "domain",
-                        "email": "",
-                        "email_original": "",
-                        "tag": tag_value,
-                        "email_account_id": pd.NA,
-                        "tag_id": tag_id_for_row,
-                    })
 
         df = pd.DataFrame(rows)
         df["email_account_id"] = pd.to_numeric(df["email_account_id"], errors="coerce").astype("Int64")
@@ -205,6 +239,7 @@ if uploaded:
         st.session_state.last_summary = None
         st.session_state.last_logs_df = None
         st.session_state.results_df = None
+        st.session_state.last_phase_summaries = None
         st.success("Mapping complete")
 
 # -------------------- Review and export mapping --------------------
@@ -225,10 +260,48 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
 if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
     st.subheader("Apply tags to Smartlead accounts")
     dry_run = st.checkbox("Dry run, do not call API", value=True, key="dry_run_checkbox")
+    overwrite_existing = st.checkbox(
+        "Overwrite existing tags",
+        value=False,
+        key="overwrite_toggle",
+        help="Removes existing tags from targeted Smartlead accounts before applying CSV tags.",
+    )
+
+    mapped_df_for_counts = st.session_state.mapped_df
+    valid_account_ids = sorted(
+        list(
+            set(
+                mapped_df_for_counts.loc[
+                    mapped_df_for_counts["email_account_id"].notna(), "email_account_id"
+                ]
+                .astype(int)
+                .tolist()
+            )
+        )
+    )
+
+    if overwrite_existing:
+        st.warning(
+            "Overwrite mode is ON: all existing tags for accounts resolved from this CSV will be removed first, "
+            "then CSV tags will be applied."
+        )
+        st.info(f"{len(valid_account_ids)} accounts will be overwritten.")
+        overwrite_confirm = st.checkbox(
+            "I understand and want to remove existing tags before applying new tags.",
+            value=False,
+            key="overwrite_confirm",
+        )
+    else:
+        overwrite_confirm = True
+
     apply_clicked = st.button("Apply Tags Now", key="apply_btn")
 
     if apply_clicked:
         df = st.session_state.mapped_df.copy()
+
+        if overwrite_existing and not overwrite_confirm:
+            st.error("Please confirm overwrite acknowledgement before applying.")
+            st.stop()
 
         # Build per-row result template
         results = df[["input_value", "input_type", "email_original", "email", "tag", "email_account_id", "tag_id"]].copy()
@@ -244,9 +317,110 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
         results.loc[mask_no_tag & mask_no_account, "status"] = "SKIPPED_NO_ACCOUNT_AND_TAG"
 
         valid = results[~mask_no_account & ~mask_no_tag].copy()
+        valid_pairs = valid[["email_account_id", "tag_id"]].drop_duplicates().copy()
+        valid_pairs["email_account_id"] = valid_pairs["email_account_id"].astype(int)
+        valid_pairs["tag_id"] = valid_pairs["tag_id"].astype(int)
 
-        # Batch apply
-        total_batches = sum((len(sub) + EMAIL_BATCH_LIMIT - 1) // EMAIL_BATCH_LIMIT for _, sub in valid.groupby("tag_id"))
+        delete_logs = []
+        delete_summary = {
+            "processed": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "failed": 0,
+            "batches": 0,
+        }
+
+        # Optional overwrite-delete phase
+        if overwrite_existing:
+            if not SMARTLEAD_BEARER:
+                st.error("SMARTLEAD_BEARER is missing in secrets.")
+                st.stop()
+
+            account_ids_to_overwrite = sorted(valid_pairs["email_account_id"].unique().tolist())
+            with st.spinner("Preparing overwrite delete phase"):
+                try:
+                    all_tags = fetch_tags_graphql_cached(SMARTLEAD_BEARER)
+                except Exception as e:
+                    st.error(f"Failed to fetch tags for overwrite: {e}")
+                    st.stop()
+
+            all_tag_ids = sorted(list(set(int(t["id"]) for t in all_tags if t.get("id") is not None)))
+            if not all_tag_ids:
+                st.error("No tags found in Smartlead; cannot run overwrite delete phase.")
+                st.stop()
+
+            planned_pairs = len(account_ids_to_overwrite) * len(all_tag_ids)
+            delete_summary["processed"] = int(planned_pairs)
+
+            if dry_run:
+                delete_summary["skipped"] = int(planned_pairs)
+                for i in range(0, len(account_ids_to_overwrite), EMAIL_BATCH_LIMIT):
+                    account_batch = account_ids_to_overwrite[i:i + EMAIL_BATCH_LIMIT]
+                    delete_logs.append(
+                        {
+                            "phase": "DELETE",
+                            "email_account_id": ",".join(str(a) for a in account_batch),
+                            "tag_ids": ",".join(str(t) for t in all_tag_ids),
+                            "batch_size": len(account_batch),
+                            "status": "SIMULATED_DELETE",
+                            "error": "",
+                        }
+                    )
+                    delete_summary["batches"] += 1
+            else:
+                for i in range(0, len(account_ids_to_overwrite), EMAIL_BATCH_LIMIT):
+                    account_batch = account_ids_to_overwrite[i:i + EMAIL_BATCH_LIMIT]
+                    tag_union = all_tag_ids
+                    ok, err_msg, resp_json = remove_tags_batch(account_batch, tag_union)
+                    delete_summary["batches"] += 1
+                    if not ok:
+                        delete_summary["failed"] += len(account_batch) * len(tag_union)
+                        delete_logs.append(
+                            {
+                                "phase": "DELETE",
+                                "email_account_id": ",".join(str(a) for a in account_batch),
+                                "tag_ids": ",".join(str(t) for t in tag_union),
+                                "batch_size": len(account_batch),
+                                "status": "FAILED",
+                                "error": err_msg,
+                            }
+                        )
+                        continue
+
+                    batch_results = resp_json.get("data", {}).get("results", []) if isinstance(resp_json, dict) else []
+                    if batch_results:
+                        for item in batch_results:
+                            action = str(item.get("action", "")).lower()
+                            if action == "deleted":
+                                delete_summary["deleted"] += 1
+                            elif action == "skipped":
+                                delete_summary["skipped"] += 1
+                            elif action == "failed":
+                                delete_summary["failed"] += 1
+                            delete_logs.append(
+                                {
+                                    "phase": "DELETE",
+                                    "email_account_id": item.get("email_account_id"),
+                                    "tag_ids": item.get("tag_id"),
+                                    "batch_size": len(account_batch),
+                                    "status": action.upper() if action else "UNKNOWN",
+                                    "error": item.get("reason", ""),
+                                }
+                            )
+                    else:
+                        delete_logs.append(
+                            {
+                                "phase": "DELETE",
+                                "email_account_id": ",".join(str(a) for a in account_batch),
+                                "tag_ids": ",".join(str(t) for t in tag_union),
+                                "batch_size": len(account_batch),
+                                "status": "DELETED",
+                                "error": "",
+                            }
+                        )
+
+        # Batch apply (deduped by account/tag pair)
+        total_batches = sum((len(sub) + EMAIL_BATCH_LIMIT - 1) // EMAIL_BATCH_LIMIT for _, sub in valid_pairs.groupby("tag_id"))
         progress = st.progress(0)
         done_batches = 0
 
@@ -254,29 +428,29 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
 
         applied = 0
         errors = 0
-        for tag_id, sub in valid.groupby("tag_id"):
+        for tag_id, sub in valid_pairs.groupby("tag_id"):
             ids = sub["email_account_id"].astype(int).tolist()
             for i in range(0, len(ids), EMAIL_BATCH_LIMIT):
                 batch = ids[i:i+EMAIL_BATCH_LIMIT]
                 if dry_run:
-                    batch_status = "SKIPPED_DRY_RUN"
+                    batch_status = "SIMULATED_APPLY"
                     ok = True
                     err_msg = ""
                 else:
                     ok, err_msg = apply_tags_batch(batch, int(tag_id))
                     batch_status = "APPLIED" if ok else "FAILED"
 
-                # Mark per-row statuses for this batch
-                rows_idx = sub.index[i:i+EMAIL_BATCH_LIMIT]
+                batch_mask = results["email_account_id"].isin(batch) & (results["tag_id"] == int(tag_id))
                 if ok:
-                    results.loc[rows_idx, "status"] = "APPLIED"
-                    applied += len(rows_idx)
+                    row_status = "SIMULATED_APPLY" if dry_run else "APPLIED"
+                    results.loc[batch_mask, "status"] = row_status
+                    applied += int(batch_mask.sum())
                 else:
-                    results.loc[rows_idx, "status"] = "FAILED"
-                    results.loc[rows_idx, "error"] = err_msg
-                    errors += len(rows_idx)
+                    results.loc[batch_mask, "status"] = "FAILED"
+                    results.loc[batch_mask, "error"] = err_msg
+                    errors += int(batch_mask.sum())
 
-                logs.append({"tag_id": int(tag_id), "batch_size": len(batch), "status": batch_status, "error": err_msg})
+                logs.append({"phase": "APPLY", "tag_id": int(tag_id), "batch_size": len(batch), "status": batch_status, "error": err_msg})
 
                 done_batches += 1
                 progress.progress(min(done_batches / max(total_batches, 1), 1.0))
@@ -285,7 +459,7 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
         skipped_tags = int((mask_no_tag & ~mask_no_account).sum())
         skipped_both = int((mask_no_tag & mask_no_account).sum())
 
-        summary = {
+        apply_summary = {
             "applied": applied,
             "skipped_accounts": skipped_accounts,
             "skipped_tags": skipped_tags,
@@ -295,13 +469,30 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
             "total_batches": int(total_batches),
         }
 
-        st.session_state.last_summary = summary
-        st.session_state.last_logs_df = pd.DataFrame(logs)
+        st.session_state.last_summary = apply_summary
+        st.session_state.last_phase_summaries = {
+            "overwrite_enabled": overwrite_existing,
+            "delete": delete_summary,
+            "apply": apply_summary,
+        }
+        st.session_state.last_logs_df = pd.DataFrame(delete_logs + logs)
         st.session_state.results_df = results
 
 # -------------------- Results and exports --------------------
 if st.session_state.last_summary is not None:
     st.success("Apply step completed")
+    if st.session_state.last_phase_summaries:
+        phase_summaries = st.session_state.last_phase_summaries
+        if phase_summaries.get("overwrite_enabled"):
+            st.markdown("**Phase A: Delete existing tags (overwrite)**")
+            d1, d2, d3, d4, d5 = st.columns(5)
+            d1.metric("Delete processed", phase_summaries["delete"]["processed"])
+            d2.metric("Deleted", phase_summaries["delete"]["deleted"])
+            d3.metric("Skipped", phase_summaries["delete"]["skipped"])
+            d4.metric("Failed", phase_summaries["delete"]["failed"])
+            d5.metric("Delete batches", phase_summaries["delete"]["batches"])
+
+        st.markdown("**Phase B: Apply CSV tags**")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Applied", st.session_state.last_summary["applied"])
     c2.metric("Skipped accounts", st.session_state.last_summary["skipped_accounts"])
