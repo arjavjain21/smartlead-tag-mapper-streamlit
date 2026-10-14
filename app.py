@@ -21,7 +21,7 @@ REST_TAGS_URL = f"{REST_BASE_URL}/email-accounts/tags"
 REST_TAG_MAPPING_URL = "https://server.smartlead.ai/api/v1/email-accounts/tag-mapping"
 EMAIL_BATCH_LIMIT = 25
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-REQUESTS_PER_MINUTE = max(1, int(os.environ.get("SMARTLEAD_REQUESTS_PER_MINUTE", "96")))
+REQUESTS_PER_MINUTE = max(1, int(os.environ.get("SMARTLEAD_REQUESTS_PER_MINUTE", "4800")))
 MAX_WORKERS = min(16, max(1, int(os.environ.get("SMARTLEAD_WORKERS", "8"))))
 _rate_lock = threading.Lock()
 _next_request_at = 0.0
@@ -95,7 +95,7 @@ def smartlead_request(method: str, url: str, **kwargs) -> requests.Response:
         time.sleep(min(max(delay, 0), 60))
     raise RuntimeError("Smartlead retry loop ended unexpectedly")
 
-def rest_rows(api_key: str, url: str, field: str, paginated: bool = False) -> List[Dict]:
+def rest_rows(api_key: str, url: str, field: str, paginated: bool = False, progress=None) -> List[Dict]:
     """Read all account pages or the complete tag catalog using the API key."""
     rows = []
     offset = 0
@@ -122,15 +122,16 @@ def rest_rows(api_key: str, url: str, field: str, paginated: bool = False) -> Li
         if not isinstance(batch, list):
             raise RuntimeError(f"Smartlead {field} list had an unexpected response format.")
         rows.extend(batch)
+        if progress:
+            progress(len(rows))
         if not paginated or len(batch) < 100:
             return rows
         offset += 100
         if offset > 1000000:
             raise RuntimeError(f"Smartlead {field} pagination exceeded 1,000,000 accounts.")
 
-@st.cache_data(show_spinner=False, ttl=300)
-def fetch_email_accounts_cached(api_key: str) -> List[Dict]:
-    rows = rest_rows(api_key, REST_EMAIL_ACCOUNTS_URL, "email_accounts", paginated=True)
+def fetch_email_accounts(api_key: str, progress=None) -> List[Dict]:
+    rows = rest_rows(api_key, REST_EMAIL_ACCOUNTS_URL, "email_accounts", paginated=True, progress=progress)
     out = []
     for r in rows:
         if r.get("id") is None or r.get("from_email") in (None, ""):
@@ -155,6 +156,18 @@ def apply_tags_batch(email_ids: List[int], tag_ids: List[int]) -> Tuple[bool, st
     body = {"email_account_ids": email_ids, "tag_ids": tag_ids}
     resp = smartlead_request("POST", url, json=body, timeout=60)
     if 200 <= resp.status_code < 300:
+        try:
+            payload = resp.json()
+        except ValueError:
+            return True, ""
+        if isinstance(payload, dict):
+            if payload.get("success") is False:
+                return False, str(payload.get("message") or "Smartlead reported success=false")[:300]
+            data = payload.get("data")
+            if isinstance(data, dict) and isinstance(data.get("results"), list):
+                failures = [item for item in data["results"] if isinstance(item, dict) and str(item.get("action", item.get("status", ""))).lower() in {"failed", "error"}]
+                if failures:
+                    return False, f"Smartlead reported {len(failures)} failed account/tag results in this batch"
         return True, ""
     try:
         return False, resp.json().get("message", resp.text[:300])
@@ -198,11 +211,13 @@ if "results_df" not in st.session_state:
     st.session_state.results_df = None
 if "last_phase_summaries" not in st.session_state:
     st.session_state.last_phase_summaries = None
+if "last_run_complete" not in st.session_state:
+    st.session_state.last_run_complete = True
 
 # -------------------- Upload and column mapping --------------------
 uploaded = st.file_uploader("Upload CSV", type=["csv"], key="uploader")
 if uploaded:
-    raw = uploaded.read()
+    raw = uploaded.getvalue()
     try:
         df_raw = robust_read_csv(raw)
     except Exception as e:
@@ -225,13 +240,16 @@ if uploaded:
         if not SMARTLEAD_API_KEY:
             st.error("SMARTLEAD_API_KEY is missing in secrets or environment variables.")
             st.stop()
+        fetch_status = st.empty()
+        fetch_status.info("Fetching Smartlead accounts: starting...")
         with st.spinner("Fetching Smartlead accounts and tags"):
             try:
-                accounts = fetch_email_accounts_cached(SMARTLEAD_API_KEY)
+                accounts = fetch_email_accounts(SMARTLEAD_API_KEY, lambda count: fetch_status.info(f"Fetched {count:,} Smartlead accounts..."))
                 tags = fetch_tags_cached(SMARTLEAD_API_KEY)
             except (requests.RequestException, ValueError, RuntimeError) as exc:
                 st.error(f"Could not fetch Smartlead data: {exc}")
                 st.stop()
+        fetch_status.success(f"Fetched {len(accounts):,} accounts and {len(tags):,} tags.")
 
         email_to_id = {trim(a["from_email"]).lower(): a["id"] for a in accounts}
         email_to_raw = {trim(a["from_email"]).lower(): a["from_email"] for a in accounts}
@@ -316,6 +334,7 @@ if uploaded:
         st.session_state.last_logs_df = None
         st.session_state.results_df = None
         st.session_state.last_phase_summaries = None
+        st.session_state.last_run_complete = True
         st.success("Mapping complete")
 
 # -------------------- Review and export mapping --------------------
@@ -374,6 +393,8 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
 
     if apply_clicked:
         df = st.session_state.mapped_df.copy()
+        st.session_state.last_run_complete = False
+        st.session_state.last_summary = None
 
         if overwrite_existing and not overwrite_confirm:
             st.error("Please confirm overwrite acknowledgement before applying.")
@@ -515,6 +536,8 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
         ]
         total_batches = len(apply_batches)
         progress = st.progress(0)
+        apply_status = st.empty()
+        apply_status.info(f"Applying tags: 0 of {total_batches:,} batches completed. Request cap: {REQUESTS_PER_MINUTE:,}/minute.")
         done_batches = 0
 
         logs = []  # list of dicts for DataFrame
@@ -552,6 +575,16 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
             logs.append({"phase": "APPLY", "tag_ids": ",".join(map(str, tag_ids)), "batch_size": len(batch), "status": "SIMULATED_APPLY" if dry_run else "APPLIED" if ok else "FAILED", "error": err_msg})
             done_batches += 1
             progress.progress(min(done_batches / max(total_batches, 1), 1.0))
+            if done_batches % 20 == 0 or done_batches == total_batches:
+                apply_status.info(f"Applying tags: {done_batches:,} of {total_batches:,} batches completed; {applied:,} rows applied, {errors:,} failed.")
+                st.session_state.last_summary = {
+                    "applied": applied, "skipped_accounts": int((mask_no_account & ~mask_no_tag).sum()),
+                    "skipped_tags": int((mask_no_tag & ~mask_no_account).sum()),
+                    "skipped_both": int((mask_no_tag & mask_no_account).sum()),
+                    "errors": errors, "total_rows": int(len(results)), "total_batches": done_batches,
+                }
+                st.session_state.last_logs_df = pd.DataFrame(delete_logs + logs)
+                st.session_state.results_df = results.copy()
 
         skipped_accounts = int((mask_no_account & ~mask_no_tag).sum())
         skipped_tags = int((mask_no_tag & ~mask_no_account).sum())
@@ -575,10 +608,15 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
         }
         st.session_state.last_logs_df = pd.DataFrame(delete_logs + logs)
         st.session_state.results_df = results
+        st.session_state.last_run_complete = True
+        apply_status.success(f"Finished {done_batches:,} batches: {applied:,} rows applied, {errors:,} failed.")
 
 # -------------------- Results and exports --------------------
 if st.session_state.last_summary is not None:
-    st.success("Apply step completed")
+    if st.session_state.last_run_complete:
+        st.success("Apply step completed")
+    else:
+        st.warning("Partial results from an interrupted apply run. Review the batch log before starting another run.")
     if st.session_state.last_phase_summaries:
         phase_summaries = st.session_state.last_phase_summaries
         if phase_summaries.get("overwrite_enabled"):
