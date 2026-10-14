@@ -25,6 +25,7 @@ REQUESTS_PER_MINUTE = max(1, int(os.environ.get("SMARTLEAD_REQUESTS_PER_MINUTE",
 MAX_WORKERS = min(16, max(1, int(os.environ.get("SMARTLEAD_WORKERS", "8"))))
 _rate_lock = threading.Lock()
 _next_request_at = 0.0
+_effective_rpm = REQUESTS_PER_MINUTE
 
 def credential(name: str) -> str:
     try:
@@ -67,12 +68,12 @@ def extract_domain(email: str) -> str:
 
 def smartlead_request(method: str, url: str, **kwargs) -> requests.Response:
     """Retry transient failures while respecting Smartlead's rate-limit response."""
-    global _next_request_at
+    global _next_request_at, _effective_rpm
     for attempt in range(5):
         with _rate_lock:
             now = time.monotonic()
             slot = max(now, _next_request_at)
-            _next_request_at = slot + 60 / REQUESTS_PER_MINUTE
+            _next_request_at = slot + 60 / _effective_rpm
         if slot > now:
             time.sleep(slot - now)
         try:
@@ -92,6 +93,10 @@ def smartlead_request(method: str, url: str, **kwargs) -> requests.Response:
                 delay = (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds()
             except (TypeError, ValueError, OverflowError):
                 delay = 2 ** attempt + random.random()
+        if resp.status_code == 429:
+            with _rate_lock:
+                _effective_rpm = max(1, _effective_rpm // 2)
+                _next_request_at = max(_next_request_at, time.monotonic() + min(max(delay, 1), 60))
         time.sleep(min(max(delay, 0), 60))
     raise RuntimeError("Smartlead retry loop ended unexpectedly")
 
@@ -355,6 +360,10 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
 if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
     st.subheader("Apply tags to Smartlead accounts")
     dry_run = st.checkbox("Dry run, do not call API", value=True, key="dry_run_checkbox")
+    if dry_run:
+        st.warning("DRY RUN: no Smartlead tags will be changed. Turn this off before a live update.")
+    else:
+        st.info("LIVE UPDATE: clicking the button will send tag changes to Smartlead.")
     overwrite_existing = st.checkbox(
         "Overwrite existing tags",
         value=False,
@@ -389,12 +398,17 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
     else:
         overwrite_confirm = True
 
-    apply_clicked = st.button("Apply Tags Now", key="apply_btn")
+    eligible_rows = int((mapped_df_for_counts["email_account_id"].notna() & mapped_df_for_counts["tag_id"].notna()).sum())
+    st.caption(f"{eligible_rows:,} mapped rows are eligible for {'simulation' if dry_run else 'live updates'} across {len(valid_account_ids):,} matched accounts.")
+    apply_clicked = st.button("Simulate Tag Updates" if dry_run else "Apply Tags to Smartlead", key="apply_btn")
 
     if apply_clicked:
         df = st.session_state.mapped_df.copy()
         st.session_state.last_run_complete = False
         st.session_state.last_summary = None
+        if eligible_rows == 0:
+            st.error("No rows have both a matched account and a matched tag. Review the mapped data before applying.")
+            st.stop()
 
         if overwrite_existing and not overwrite_confirm:
             st.error("Please confirm overwrite acknowledgement before applying.")
@@ -555,7 +569,7 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
                         batch, tag_ids = futures[future]
                         try:
                             ok, err_msg = future.result()
-                        except requests.RequestException as exc:
+                        except Exception as exc:
                             ok, err_msg = False, type(exc).__name__
                         yield batch, tag_ids, ok, err_msg
                 finally:
@@ -576,7 +590,7 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
             done_batches += 1
             progress.progress(min(done_batches / max(total_batches, 1), 1.0))
             if done_batches % 20 == 0 or done_batches == total_batches:
-                apply_status.info(f"Applying tags: {done_batches:,} of {total_batches:,} batches completed; {applied:,} rows applied, {errors:,} failed.")
+                apply_status.info(f"{'Simulating' if dry_run else 'Applying'} tags: {done_batches:,} of {total_batches:,} batches completed; {applied:,} rows {'simulated' if dry_run else 'applied'}, {errors:,} failed.")
                 st.session_state.last_summary = {
                     "applied": applied, "skipped_accounts": int((mask_no_account & ~mask_no_tag).sum()),
                     "skipped_tags": int((mask_no_tag & ~mask_no_account).sum()),
@@ -603,17 +617,21 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
         st.session_state.last_summary = apply_summary
         st.session_state.last_phase_summaries = {
             "overwrite_enabled": overwrite_existing,
+            "dry_run": dry_run,
             "delete": delete_summary,
             "apply": apply_summary,
         }
         st.session_state.last_logs_df = pd.DataFrame(delete_logs + logs)
         st.session_state.results_df = results
         st.session_state.last_run_complete = True
-        apply_status.success(f"Finished {done_batches:,} batches: {applied:,} rows applied, {errors:,} failed.")
+        apply_status.success(f"Finished {done_batches:,} batches: {applied:,} rows {'simulated; no tags changed' if dry_run else 'applied'}, {errors:,} failed.")
 
 # -------------------- Results and exports --------------------
 if st.session_state.last_summary is not None:
-    if st.session_state.last_run_complete:
+    was_dry_run = bool((st.session_state.last_phase_summaries or {}).get("dry_run"))
+    if st.session_state.last_run_complete and was_dry_run:
+        st.warning("Dry run completed. No Smartlead tags were changed.")
+    elif st.session_state.last_run_complete:
         st.success("Apply step completed")
     else:
         st.warning("Partial results from an interrupted apply run. Review the batch log before starting another run.")
@@ -630,7 +648,7 @@ if st.session_state.last_summary is not None:
 
         st.markdown("**Phase B: Apply CSV tags**")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Applied", st.session_state.last_summary["applied"])
+    c1.metric("Simulated" if was_dry_run else "Applied", st.session_state.last_summary["applied"])
     c2.metric("Skipped accounts", st.session_state.last_summary["skipped_accounts"])
     c3.metric("Skipped tags", st.session_state.last_summary["skipped_tags"])
     c4.metric("Skipped both", st.session_state.last_summary["skipped_both"])
