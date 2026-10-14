@@ -1,5 +1,12 @@
 
 import io
+import os
+import random
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
 import chardet
@@ -8,12 +15,24 @@ import requests
 import streamlit as st
 
 # -------------------- Config --------------------
-GRAPHQL_URL = "https://fe-gql.smartlead.ai/v1/graphql"
+REST_BASE_URL = "https://server.smartlead.ai/api/v1"
+REST_EMAIL_ACCOUNTS_URL = f"{REST_BASE_URL}/email-accounts/"
+REST_TAGS_URL = f"{REST_BASE_URL}/email-accounts/tags"
 REST_TAG_MAPPING_URL = "https://server.smartlead.ai/api/v1/email-accounts/tag-mapping"
 EMAIL_BATCH_LIMIT = 25
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+REQUESTS_PER_MINUTE = max(1, int(os.environ.get("SMARTLEAD_REQUESTS_PER_MINUTE", "96")))
+MAX_WORKERS = min(16, max(1, int(os.environ.get("SMARTLEAD_WORKERS", "8"))))
+_rate_lock = threading.Lock()
+_next_request_at = 0.0
 
-SMARTLEAD_BEARER = st.secrets.get("SMARTLEAD_BEARER", "").strip()
-SMARTLEAD_API_KEY = st.secrets.get("SMARTLEAD_API_KEY", "").strip()
+def credential(name: str) -> str:
+    try:
+        return str(st.secrets.get(name, os.environ.get(name, ""))).strip()
+    except st.errors.StreamlitSecretNotFoundError:
+        return os.environ.get(name, "").strip()
+
+SMARTLEAD_API_KEY = credential("SMARTLEAD_API_KEY")
 
 st.set_page_config(page_title="Smartlead Tag Mapper", page_icon="🔖", layout="wide")
 st.title("Smartlead Tag Mapper v7")
@@ -46,14 +65,72 @@ def extract_domain(email: str) -> str:
         return ""
     return email.split("@", 1)[1]
 
+def smartlead_request(method: str, url: str, **kwargs) -> requests.Response:
+    """Retry transient failures while respecting Smartlead's rate-limit response."""
+    global _next_request_at
+    for attempt in range(5):
+        with _rate_lock:
+            now = time.monotonic()
+            slot = max(now, _next_request_at)
+            _next_request_at = slot + 60 / REQUESTS_PER_MINUTE
+        if slot > now:
+            time.sleep(slot - now)
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 4:
+                raise
+            time.sleep(min(2 ** attempt + random.random(), 30))
+            continue
+        if resp.status_code not in RETRYABLE_STATUS or attempt == 4:
+            return resp
+        retry_after = resp.headers.get("Retry-After", "")
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            try:
+                delay = (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                delay = 2 ** attempt + random.random()
+        time.sleep(min(max(delay, 0), 60))
+    raise RuntimeError("Smartlead retry loop ended unexpectedly")
+
+def rest_rows(api_key: str, url: str, field: str, paginated: bool = False) -> List[Dict]:
+    """Read all account pages or the complete tag catalog using the API key."""
+    rows = []
+    offset = 0
+    while True:
+        params = {"api_key": api_key}
+        if paginated:
+            params.update({"limit": 100, "offset": offset})
+        resp = smartlead_request("GET", url, params=params, timeout=60)
+        if not resp.ok:
+            raise RuntimeError(f"Smartlead {field} list returned HTTP {resp.status_code}. Check the API key and endpoint access.")
+        payload = resp.json()
+        if isinstance(payload, list):
+            batch = payload
+        elif isinstance(payload, dict):
+            data = payload.get("data", payload)
+            if isinstance(data, list):
+                batch = data
+            elif isinstance(data, dict):
+                batch = data.get(field, data.get("results", data.get("items")))
+            else:
+                batch = None
+        else:
+            batch = None
+        if not isinstance(batch, list):
+            raise RuntimeError(f"Smartlead {field} list had an unexpected response format.")
+        rows.extend(batch)
+        if not paginated or len(batch) < 100:
+            return rows
+        offset += 100
+        if offset > 1000000:
+            raise RuntimeError(f"Smartlead {field} pagination exceeded 1,000,000 accounts.")
+
 @st.cache_data(show_spinner=False, ttl=300)
-def fetch_email_accounts_graphql_cached(bearer: str) -> List[Dict]:
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {bearer}"}
-    q = "query { email_accounts { id from_email } }"
-    resp = requests.post(GRAPHQL_URL, headers=headers, json={"query": q}, timeout=60)
-    resp.raise_for_status()
-    payload = resp.json()
-    rows = payload["data"]["email_accounts"]
+def fetch_email_accounts_cached(api_key: str) -> List[Dict]:
+    rows = rest_rows(api_key, REST_EMAIL_ACCOUNTS_URL, "email_accounts", paginated=True)
     out = []
     for r in rows:
         if r.get("id") is None or r.get("from_email") in (None, ""):
@@ -62,13 +139,8 @@ def fetch_email_accounts_graphql_cached(bearer: str) -> List[Dict]:
     return out
 
 @st.cache_data(show_spinner=False, ttl=300)
-def fetch_tags_graphql_cached(bearer: str) -> List[Dict]:
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {bearer}"}
-    q = "query { tags { id name } }"
-    resp = requests.post(GRAPHQL_URL, headers=headers, json={"query": q}, timeout=60)
-    resp.raise_for_status()
-    payload = resp.json()
-    rows = payload["data"]["tags"]
+def fetch_tags_cached(api_key: str) -> List[Dict]:
+    rows = rest_rows(api_key, REST_TAGS_URL, "tags")
     out = []
     for r in rows:
         if r.get("id") is None or r.get("name") in (None, ""):
@@ -76,12 +148,12 @@ def fetch_tags_graphql_cached(bearer: str) -> List[Dict]:
         out.append({"id": int(r["id"]), "name": r["name"]})
     return out
 
-def apply_tags_batch(email_ids: List[int], tag_id: int) -> Tuple[bool, str]:
+def apply_tags_batch(email_ids: List[int], tag_ids: List[int]) -> Tuple[bool, str]:
     if not SMARTLEAD_API_KEY:
         return False, "SMARTLEAD_API_KEY missing"
     url = f"{REST_TAG_MAPPING_URL}?api_key={SMARTLEAD_API_KEY}"
-    body = {"email_account_ids": email_ids, "tag_ids": [tag_id]}
-    resp = requests.post(url, json=body, timeout=60)
+    body = {"email_account_ids": email_ids, "tag_ids": tag_ids}
+    resp = smartlead_request("POST", url, json=body, timeout=60)
     if 200 <= resp.status_code < 300:
         return True, ""
     try:
@@ -102,7 +174,7 @@ def remove_tags_batch(email_ids: List[int], tag_ids: List[int]) -> Tuple[bool, s
 
     url = f"{REST_TAG_MAPPING_URL}?api_key={SMARTLEAD_API_KEY}"
     body = {"email_account_ids": email_ids, "tag_ids": tag_ids}
-    resp = requests.delete(url, json=body, timeout=90)
+    resp = smartlead_request("DELETE", url, json=body, timeout=90)
     if 200 <= resp.status_code < 300:
         try:
             return True, "", resp.json()
@@ -150,12 +222,16 @@ if uploaded:
     case_insensitive = st.checkbox("Case-insensitive tag matching", value=False, key="case_toggle")
 
     if st.button("Fetch and Map", key="fetch_map_btn"):
-        if not SMARTLEAD_BEARER:
-            st.error("SMARTLEAD_BEARER is missing in secrets.")
+        if not SMARTLEAD_API_KEY:
+            st.error("SMARTLEAD_API_KEY is missing in secrets or environment variables.")
             st.stop()
         with st.spinner("Fetching Smartlead accounts and tags"):
-            accounts = fetch_email_accounts_graphql_cached(SMARTLEAD_BEARER)
-            tags = fetch_tags_graphql_cached(SMARTLEAD_BEARER)
+            try:
+                accounts = fetch_email_accounts_cached(SMARTLEAD_API_KEY)
+                tags = fetch_tags_cached(SMARTLEAD_API_KEY)
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
+                st.error(f"Could not fetch Smartlead data: {exc}")
+                st.stop()
 
         email_to_id = {trim(a["from_email"]).lower(): a["id"] for a in accounts}
         email_to_raw = {trim(a["from_email"]).lower(): a["from_email"] for a in accounts}
@@ -332,14 +408,14 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
 
         # Optional overwrite-delete phase
         if overwrite_existing:
-            if not SMARTLEAD_BEARER:
-                st.error("SMARTLEAD_BEARER is missing in secrets.")
+            if not SMARTLEAD_API_KEY:
+                st.error("SMARTLEAD_API_KEY is missing in secrets or environment variables.")
                 st.stop()
 
             account_ids_to_overwrite = sorted(valid_pairs["email_account_id"].unique().tolist())
             with st.spinner("Preparing overwrite delete phase"):
                 try:
-                    all_tags = fetch_tags_graphql_cached(SMARTLEAD_BEARER)
+                    all_tags = fetch_tags_cached(SMARTLEAD_API_KEY)
                 except Exception as e:
                     st.error(f"Failed to fetch tags for overwrite: {e}")
                     st.stop()
@@ -371,7 +447,10 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
                 for i in range(0, len(account_ids_to_overwrite), EMAIL_BATCH_LIMIT):
                     account_batch = account_ids_to_overwrite[i:i + EMAIL_BATCH_LIMIT]
                     tag_union = all_tag_ids
-                    ok, err_msg, resp_json = remove_tags_batch(account_batch, tag_union)
+                    try:
+                        ok, err_msg, resp_json = remove_tags_batch(account_batch, tag_union)
+                    except requests.RequestException as exc:
+                        ok, err_msg, resp_json = False, type(exc).__name__, {}
                     delete_summary["batches"] += 1
                     if not ok:
                         delete_summary["failed"] += len(account_batch) * len(tag_union)
@@ -419,8 +498,22 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
                             }
                         )
 
-        # Batch apply (deduped by account/tag pair)
-        total_batches = sum((len(sub) + EMAIL_BATCH_LIMIT - 1) // EMAIL_BATCH_LIMIT for _, sub in valid_pairs.groupby("tag_id"))
+        if overwrite_existing and not dry_run and delete_summary["failed"]:
+            st.error("Some tag deletions failed. Apply was stopped to avoid adding tags to accounts that were not cleared. Review the Smartlead API access and retry.")
+            st.dataframe(pd.DataFrame(delete_logs), use_container_width=True)
+            st.stop()
+
+        # Accounts with the same tag set share one request of up to 25 accounts.
+        account_tag_sets = valid_pairs.groupby("email_account_id")["tag_id"].apply(lambda values: tuple(sorted(values.astype(int).tolist())))
+        grouped_accounts = {}
+        for account_id, tag_ids in account_tag_sets.items():
+            grouped_accounts.setdefault(tag_ids, []).append(int(account_id))
+        apply_batches = [
+            (account_ids[i:i + EMAIL_BATCH_LIMIT], list(tag_ids))
+            for tag_ids, account_ids in grouped_accounts.items()
+            for i in range(0, len(account_ids), EMAIL_BATCH_LIMIT)
+        ]
+        total_batches = len(apply_batches)
         progress = st.progress(0)
         done_batches = 0
 
@@ -428,32 +521,37 @@ if st.session_state.mapping_ready and st.session_state.mapped_df is not None:
 
         applied = 0
         errors = 0
-        for tag_id, sub in valid_pairs.groupby("tag_id"):
-            ids = sub["email_account_id"].astype(int).tolist()
-            for i in range(0, len(ids), EMAIL_BATCH_LIMIT):
-                batch = ids[i:i+EMAIL_BATCH_LIMIT]
-                if dry_run:
-                    batch_status = "SIMULATED_APPLY"
-                    ok = True
-                    err_msg = ""
-                else:
-                    ok, err_msg = apply_tags_batch(batch, int(tag_id))
-                    batch_status = "APPLIED" if ok else "FAILED"
+        if dry_run:
+            batch_outcomes = ((batch, tag_ids, True, "") for batch, tag_ids in apply_batches)
+        else:
+            pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+            futures = {pool.submit(apply_tags_batch, batch, tag_ids): (batch, tag_ids) for batch, tag_ids in apply_batches}
+            def completed_batches():
+                try:
+                    for future in as_completed(futures):
+                        batch, tag_ids = futures[future]
+                        try:
+                            ok, err_msg = future.result()
+                        except requests.RequestException as exc:
+                            ok, err_msg = False, type(exc).__name__
+                        yield batch, tag_ids, ok, err_msg
+                finally:
+                    pool.shutdown(wait=True)
+            batch_outcomes = completed_batches()
 
-                batch_mask = results["email_account_id"].isin(batch) & (results["tag_id"] == int(tag_id))
-                if ok:
-                    row_status = "SIMULATED_APPLY" if dry_run else "APPLIED"
-                    results.loc[batch_mask, "status"] = row_status
-                    applied += int(batch_mask.sum())
-                else:
-                    results.loc[batch_mask, "status"] = "FAILED"
-                    results.loc[batch_mask, "error"] = err_msg
-                    errors += int(batch_mask.sum())
-
-                logs.append({"phase": "APPLY", "tag_id": int(tag_id), "batch_size": len(batch), "status": batch_status, "error": err_msg})
-
-                done_batches += 1
-                progress.progress(min(done_batches / max(total_batches, 1), 1.0))
+        for batch, tag_ids, ok, err_msg in batch_outcomes:
+            batch_mask = results["email_account_id"].isin(batch) & results["tag_id"].isin(tag_ids)
+            if ok:
+                row_status = "SIMULATED_APPLY" if dry_run else "APPLIED"
+                results.loc[batch_mask, "status"] = row_status
+                applied += int(batch_mask.sum())
+            else:
+                results.loc[batch_mask, "status"] = "FAILED"
+                results.loc[batch_mask, "error"] = err_msg
+                errors += int(batch_mask.sum())
+            logs.append({"phase": "APPLY", "tag_ids": ",".join(map(str, tag_ids)), "batch_size": len(batch), "status": "SIMULATED_APPLY" if dry_run else "APPLIED" if ok else "FAILED", "error": err_msg})
+            done_batches += 1
+            progress.progress(min(done_batches / max(total_batches, 1), 1.0))
 
         skipped_accounts = int((mask_no_account & ~mask_no_tag).sum())
         skipped_tags = int((mask_no_tag & ~mask_no_account).sum())
