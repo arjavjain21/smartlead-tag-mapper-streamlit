@@ -20,6 +20,7 @@ REST_EMAIL_ACCOUNTS_URL = f"{REST_BASE_URL}/email-accounts/"
 REST_TAGS_URL = f"{REST_BASE_URL}/email-accounts/tags"
 REST_TAG_MAPPING_URL = "https://server.smartlead.ai/api/v1/email-accounts/tag-mapping"
 EMAIL_BATCH_LIMIT = 25
+ACCOUNT_PAGE_LIMIT = 500
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 REQUESTS_PER_MINUTE = max(1, int(os.environ.get("SMARTLEAD_REQUESTS_PER_MINUTE", "4800")))
 MAX_WORKERS = min(16, max(1, int(os.environ.get("SMARTLEAD_WORKERS", "8"))))
@@ -104,11 +105,17 @@ def rest_rows(api_key: str, url: str, field: str, paginated: bool = False, progr
     """Read all account pages or the complete tag catalog using the API key."""
     rows = []
     offset = 0
+    page_limit = ACCOUNT_PAGE_LIMIT
+    seen_account_ids = set()
     while True:
         params = {"api_key": api_key}
         if paginated:
-            params.update({"limit": 100, "offset": offset})
+            params.update({"limit": page_limit, "offset": offset})
         resp = smartlead_request("GET", url, params=params, timeout=60)
+        if paginated and offset == 0 and page_limit == ACCOUNT_PAGE_LIMIT and resp.status_code in (400, 422):
+            # Some Smartlead plans cap account pages at 100.
+            page_limit = 100
+            continue
         if not resp.ok:
             raise RuntimeError(f"Smartlead {field} list returned HTTP {resp.status_code}. Check the API key and endpoint access.")
         payload = resp.json()
@@ -126,12 +133,17 @@ def rest_rows(api_key: str, url: str, field: str, paginated: bool = False, progr
             batch = None
         if not isinstance(batch, list):
             raise RuntimeError(f"Smartlead {field} list had an unexpected response format.")
+        if paginated and batch:
+            ids = [item.get("id") for item in batch if isinstance(item, dict)]
+            if len(ids) != len(batch) or any(account_id in seen_account_ids for account_id in ids):
+                raise RuntimeError("Smartlead account pagination returned duplicate or invalid accounts; stopped to avoid an incomplete mapping.")
+            seen_account_ids.update(ids)
         rows.extend(batch)
         if progress:
             progress(len(rows))
-        if not paginated or len(batch) < 100:
+        if not paginated or not batch:
             return rows
-        offset += 100
+        offset += len(batch)
         if offset > 1000000:
             raise RuntimeError(f"Smartlead {field} pagination exceeded 1,000,000 accounts.")
 
